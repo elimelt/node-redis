@@ -17,6 +17,7 @@ import { WaitQueue } from './wait-queue';
 import { TcpNetConnectOpts } from 'node:net';
 import { RedisTcpSocketOptions } from '../client/socket';
 import { BasicPooledClientSideCache, PooledClientSideCacheProvider } from '../client/cache';
+import { ClientIdentity, ClientRole, generateClientId } from '../client/identity';
 
 interface ClientInfo {
   id: number;
@@ -272,6 +273,7 @@ export default class RedisSentinel<
 
   #internal: RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>;
   #options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>;
+  readonly #identity: ClientIdentity;
 
   /**
    * Indicates if the sentinel connection is open
@@ -295,6 +297,14 @@ export default class RedisSentinel<
     return this._self.#commandOptions;
   }
 
+  /**
+   * @internal
+   * Returns the sentinel identity for tracking in metrics.
+   */
+  get identity(): ClientIdentity {
+    return this._self.#identity;
+  }
+
   #commandOptions?: CommandOptions<TYPE_MAPPING>;
 
   #trace: (msg: string) => unknown = () => { };
@@ -312,13 +322,19 @@ export default class RedisSentinel<
 
     this._self = this;
 
+    const firstSentinel = options.sentinelRootNodes[0];
+
+    this.#identity = {
+      id: generateClientId(firstSentinel?.host, firstSentinel?.port, undefined),
+      role: ClientRole.SENTINEL,
+    };
     this.#options = options;
 
     if (options.commandOptions) {
       this.#commandOptions = options.commandOptions;
     }
 
-    this.#internal = new RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>(options);
+    this.#internal = new RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>(options, this.#identity.id);
     this.#internal.on('error', err => this.emit('error', err));
 
     /* pass through underling events */
@@ -407,6 +423,20 @@ export default class RedisSentinel<
    */
   withTypeMapping<TYPE_MAPPING extends TypeMapping>(typeMapping: TYPE_MAPPING) {
     return this._commandOptionsProxy('typeMapping', typeMapping);
+  }
+
+  duplicate<
+    _M extends RedisModules = M,
+    _F extends RedisFunctions = F,
+    _S extends RedisScripts = S,
+    _RESP extends RespVersions = RESP,
+    _TYPE_MAPPING extends TypeMapping = TYPE_MAPPING
+  >(overrides?: Partial<RedisSentinelOptions<_M, _F, _S, _RESP, _TYPE_MAPPING>>) {
+    return new (Object.getPrototypeOf(this).constructor)({
+      ...this._self.#options,
+      commandOptions: this._self.#commandOptions,
+      ...overrides
+    }) as RedisSentinelType<_M, _F, _S, _RESP, _TYPE_MAPPING>;
   }
 
   async connect() {
@@ -643,6 +673,7 @@ export class RedisSentinelInternal<
   }
 
   readonly #name: string;
+  readonly #sentinelClientId: string;
   readonly #nodeClientOptions: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING, RedisTcpSocketOptions>;
   readonly #sentinelClientOptions: RedisClientOptions<typeof RedisSentinelModule, RedisFunctions, RedisScripts, RespVersions, TypeMapping, RedisTcpSocketOptions>;
   readonly #nodeAddressMap?: NodeAddressMap;
@@ -651,6 +682,8 @@ export class RedisSentinelInternal<
   readonly #RESP?: RespVersions;
 
   #anotherReset = false;
+
+  readonly #sentinelSeedNodes: Array<RedisNode>;
 
   #sentinelRootNodes: Array<RedisNode>;
   #sentinelClient?: RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>;
@@ -688,15 +721,17 @@ export class RedisSentinelInternal<
     }
   }
 
-  constructor(options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>) {
+  constructor(options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>, sentinelClientId: string) {
     super();
 
     this.#validateOptions(options);
 
     this.#name = options.name;
+    this.#sentinelClientId = sentinelClientId;
 
     this.#RESP = options.RESP;
-    this.#sentinelRootNodes = Array.from(options.sentinelRootNodes);
+    this.#sentinelSeedNodes = Array.from(options.sentinelRootNodes);
+    this.#sentinelRootNodes = Array.from(this.#sentinelSeedNodes);
     this.#maxCommandRediscovers = options.maxCommandRediscovers ?? 16;
     this.#masterPoolSize = options.masterPoolSize ?? 1;
     this.#replicaPoolSize = options.replicaPoolSize ?? 0;
@@ -740,7 +775,7 @@ export class RedisSentinelInternal<
 
   #createClient(node: RedisNode, clientOptions: RedisClientOptions, reconnectStrategy?: false) {
     const socket = getMappedNode(node.host, node.port, this.#nodeAddressMap);
-    return RedisClient.create({
+    const client = RedisClient.create({
       //first take the globally set RESP
       RESP: this.#RESP,
       //then take the client options, which can in theory overwrite it
@@ -752,6 +787,8 @@ export class RedisSentinelInternal<
         ...(reconnectStrategy !== undefined && { reconnectStrategy })
       }
     });
+    client._setIdentity(ClientRole.SENTINEL_CLIENT, this.#sentinelClientId);
+    return client;
   }
 
   /**
@@ -952,6 +989,19 @@ export class RedisSentinelInternal<
     }
   }
 
+  #sentinelNodeListKey(nodes: Array<RedisNode>) {
+    return nodes.map(node => `${node.host}:${node.port}`).sort().join('|');
+  }
+
+  #restoreSentinelRootNodesIfEmpty() {
+    if (this.#sentinelRootNodes.length !== 0) {
+      return;
+    }
+
+    this.#trace("restoring sentinel roots from seed nodes");
+    this.#sentinelRootNodes = Array.from(this.#sentinelSeedNodes);
+  }
+
   #handleSentinelFailure(node: RedisNode) {
     const found = this.#sentinelRootNodes.findIndex(
         (rootNode) => rootNode.host === node.host && rootNode.port === node.port
@@ -959,6 +1009,7 @@ export class RedisSentinelInternal<
     if (found !== -1) {
         this.#sentinelRootNodes.splice(found, 1);
     }
+    this.#restoreSentinelRootNodesIfEmpty();
     this.#reset();
   }
 
@@ -1105,6 +1156,8 @@ export class RedisSentinelInternal<
 
   // observe/analyze/transform remediation functions
   async observe() {
+    this.#restoreSentinelRootNodesIfEmpty();
+
     for (const node of this.#sentinelRootNodes) {
       let client: RedisClientType<typeof RedisSentinelModule, {}, {}, RespVersions, {}> | undefined;
       try {
@@ -1248,8 +1301,7 @@ export class RedisSentinelInternal<
         };
         this.emit('client-error', event);
         this.#handleSentinelFailure(node);
-      })
-      .on('end', () => this.#handleSentinelFailure(node));
+      });
       this.#sentinelClient = client;
 
       this.#trace(`transform: adding sentinel client connect() to promise list`);
@@ -1384,7 +1436,7 @@ export class RedisSentinelInternal<
       }
     }
 
-    if (analyzed.sentinelList.length != this.#sentinelRootNodes.length) {
+    if (this.#sentinelNodeListKey(analyzed.sentinelList) !== this.#sentinelNodeListKey(this.#sentinelRootNodes)) {
       this.#sentinelRootNodes = analyzed.sentinelList;
       const event: RedisSentinelEvent = {
         type: "SENTINE_LIST_CHANGE",

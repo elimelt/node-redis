@@ -21,6 +21,11 @@ import { BasicCommandParser, CommandParser } from './parser';
 import SingleEntryCache from '../single-entry-cache';
 import { version } from '../../package.json'
 import EnterpriseMaintenanceManager, { MaintenanceUpdate, MovingEndpointType, SMIGRATED_EVENT, SMigratedEvent } from './enterprise-maintenance-manager';
+import { ClientMetricsHandle, ClientRegistry } from '../opentelemetry';
+import { ClientIdentity, ClientRole, generateClientId } from './identity';
+import { trace, sanitizeArgs, publish, CHANNELS, type CommandTraceContext } from './tracing';
+
+const noop = () => {};
 
 export interface RedisClientOptions<
   M extends RedisModules = RedisModules,
@@ -444,7 +449,7 @@ export default class RedisClient<
   private _commandOptions?: CommandOptions<TYPE_MAPPING>;
   // flag used to annotate that the client
   // was in a watch transaction when
-  // a topology change occured
+  // a topology change occurred
   #dirtyWatch?: string;
   #watchEpoch?: number;
   #clientSideCache?: ClientSideCacheProvider;
@@ -454,6 +459,8 @@ export default class RedisClient<
   // 1. New socket to be ready after maintenance redirect
   // 2. In-flight commands on the old socket to complete
   #paused = false;
+  #clientIdentity: ClientIdentity;
+  #registered = false;
 
   get clientSideCache() {
     return this._self.#clientSideCache;
@@ -461,6 +468,69 @@ export default class RedisClient<
 
   get options(): RedisClientOptions<M, F, S, RESP> {
     return this._self.#options;
+  }
+
+  /**
+   * @internal
+   * Returns the client ID for metrics attribution.
+   */
+  get _clientId(): string {
+    return this._self.#clientIdentity.id;
+  }
+
+  /**
+   * @internal
+   * Sets the client identity. Used by pool/cluster/sentinel when creating child clients.
+   */
+  _setIdentity(role: ClientRole, parentId?: string): void {
+    this._self.#clientIdentity.role = role;
+
+    if (parentId) {
+      this._self.#clientIdentity.parentId = parentId;
+    }
+  }
+
+  /**
+   * @internal
+   * Creates a metrics handle for this client.
+   */
+  #createMetricsHandle(): ClientMetricsHandle {
+    return {
+      identity: this._self.#clientIdentity,
+      getAttributes: () => ({
+        host: this._self.#socket.host,
+        port: this._self.#socket.port,
+        db: this._self.#selectedDB,
+        clientId: this._self.#clientIdentity.id,
+        parentId: this._self.#clientIdentity.parentId,
+        isPubSub: this._self.#queue.isPubSubActive,
+      }),
+      getPendingRequests: () => this._self.#queue.pendingCount,
+      getCacheItemCount: () => this._self.#clientSideCache?.size() ?? 0,
+      isConnected: () => this._self.#socket.isReady
+    };
+  }
+
+  /**
+   * @internal
+   * Registers this client with the metrics registry.
+   */
+  #registerForMetrics(): void {
+    if (this.#registered) {
+      return;
+    }
+    ClientRegistry.instance.register(this.#createMetricsHandle());
+    this.#registered = true;
+  }
+
+  /**
+   * @internal
+   * Unregisters this client from the metrics registry.
+   */
+  #unregisterFromMetrics(): void {
+    if (!this.#registered) return;
+    ClientRegistry.instance.unregister(this.#clientIdentity.id);
+    this.#registered = false;
   }
 
   get isOpen(): boolean {
@@ -505,9 +575,17 @@ export default class RedisClient<
     super();
     this.#validateOptions(options)
     this.#options = this.#initiateOptions(options);
-    this.#queue = this.#initiateQueue();
-    this.#socket = this.#initiateSocket();
 
+    const socketOpts = this.#options.socket as { host?: string; port?: number } | undefined;
+    this.#clientIdentity = {
+      id: generateClientId(socketOpts?.host, socketOpts?.port, this.#selectedDB),
+      role: ClientRole.STANDALONE
+    };
+
+    this.#queue = this.#initiateQueue(this.#clientIdentity.id);
+    this.#socket = this.#initiateSocket(this.#clientIdentity.id);
+
+    this.#registerForMetrics();
 
     if(this.#options.maintNotifications !== 'disabled') {
       new EnterpriseMaintenanceManager(this.#queue, this, this.#options);
@@ -601,11 +679,12 @@ export default class RedisClient<
     return options;
   }
 
-  #initiateQueue(): RedisCommandsQueue {
+  #initiateQueue(clientId: string): RedisCommandsQueue {
     return new RedisCommandsQueue(
       this.#options.RESP ?? 2,
       this.#options.commandsQueueMaxLength,
-      (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners)
+      (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
+      clientId
     );
   }
 
@@ -775,7 +854,7 @@ export default class RedisClient<
       commands.push({cmd: ['CLIENT', 'TRACKING', 'ON']});
     }
 
-    const maintenanceHandshakeCmd = await EnterpriseMaintenanceManager.getHandshakeCommand(this.#options);
+    const maintenanceHandshakeCmd = await EnterpriseMaintenanceManager.getHandshakeCommand(this.#options, this._clientId);
 
     if(maintenanceHandshakeCmd) {
       commands.push(maintenanceHandshakeCmd);
@@ -813,7 +892,7 @@ export default class RedisClient<
     .on('end', () => this.emit('end'));
   }
 
-  #initiateSocket(): RedisSocket {
+  #initiateSocket(clientId: string): RedisSocket {
     const socketInitiator = async () => {
       const promises = [],
         chainId = Symbol('Socket Initiator');
@@ -849,7 +928,11 @@ export default class RedisClient<
       }
     };
 
-    const socket = new RedisSocket(socketInitiator, this.#options.socket);
+    const socket = new RedisSocket(
+      socketInitiator,
+      clientId,
+      this.#options.socket,
+    );
     this.#attachListeners(socket);
     return socket;
   }
@@ -959,7 +1042,13 @@ export default class RedisClient<
   }
 
   async connect() {
-    await this._self.#socket.connect();
+    await trace(CHANNELS.TRACE_CONNECT,
+      () => this._self.#socket.connect(),
+      () => ({
+        ...this._self.#socketTraceContext(),
+        clientId: this._self._clientId
+      })
+    );
     return this as unknown as RedisClientType<M, F, S, RESP, TYPE_MAPPING>;
   }
 
@@ -1042,10 +1131,11 @@ export default class RedisClient<
     } else {
       const reply = await fn();
 
-      if (transformReply) {
-        return transformReply(reply, parser.preserve, commandOptions?.typeMapping);
-      }
-      return reply;
+      const finalReply = transformReply ? transformReply(reply, parser.preserve, commandOptions?.typeMapping) : reply;
+
+      publish(CHANNELS.COMMAND_REPLY, () => ({ args: sanitizeArgs(parser.redisArgs), reply: finalReply, clientId: this._self._clientId }));
+
+      return finalReply;
     }
   }
 
@@ -1080,21 +1170,50 @@ export default class RedisClient<
     args: ReadonlyArray<RedisArgument>,
     options?: CommandOptions
   ): Promise<T> {
-    if (!this._self.#socket.isOpen) {
-      return Promise.reject(new ClientClosedError());
-    } else if (!this._self.#socket.isReady && this._self.#options.disableOfflineQueue) {
-      return Promise.reject(new ClientOfflineError());
-    }
+    return trace(CHANNELS.TRACE_COMMAND,
+      () => {
+        if (!this._self.#socket.isOpen) {
+          return Promise.reject(new ClientClosedError());
+        } else if (
+          !this._self.#socket.isReady &&
+          this._self.#options.disableOfflineQueue
+        ) {
+          return Promise.reject(new ClientOfflineError());
+        }
 
-    // Merge global options with provided options
-    const opts = {
-      ...this._self._commandOptions,
-      ...options,
-    }
+        // Merge global options with provided options
+        const opts = {
+          ...this._self._commandOptions,
+          ...options,
+        };
 
-    const promise = this._self.#queue.addCommand<T>(args, opts);
-    this._self.#scheduleWrite();
-    return promise;
+        const promise = this._self.#queue.addCommand<T>(args, opts);
+        this._self.#scheduleWrite();
+        return promise;
+      },
+      () => this._self.#commandTraceContext(args)
+    );
+  }
+
+  #commandTraceContext(args: ReadonlyArray<RedisArgument>): CommandTraceContext {
+    return {
+      command: String(args[0]).toUpperCase(),
+      args: sanitizeArgs(args),
+      database: this.#selectedDB,
+      clientId: this._clientId,
+      ...this.#socketTraceContext()
+    };
+  }
+
+  #socketTraceContext(): { serverAddress: string; serverPort: number | undefined } {
+    const socketOptions = this.#options.socket;
+    if (socketOptions && 'path' in socketOptions) {
+      return { serverAddress: socketOptions.path as string, serverPort: undefined };
+    }
+    return {
+      serverAddress: socketOptions?.host ?? 'localhost',
+      serverPort: socketOptions?.port ?? 6379
+    };
   }
 
   async SELECT(db: number): Promise<void> {
@@ -1286,21 +1405,49 @@ export default class RedisClient<
       return Promise.reject(new ClientClosedError());
     }
 
-    const chainId = Symbol('Pipeline Chain'),
-      promise = Promise.all(
-        commands.map(({ args }) => this._self.#queue.addCommand(args, {
-          chainId,
-          typeMapping: this._commandOptions?.typeMapping
-        }))
-      );
-    this._self.#scheduleWrite();
-    const result = await promise;
+    const batchSize = commands.length;
 
-    if (selectedDB !== undefined) {
-      this._self.#selectedDB = selectedDB;
-    }
+    return trace(CHANNELS.TRACE_BATCH,
+      async () => {
+        const chainId = Symbol('Pipeline Chain');
+        const promise = Promise.all(
+          commands.map(({ args }) => {
+            const traced = trace(CHANNELS.TRACE_COMMAND,
+              () => this._self.#queue.addCommand(args, {
+                chainId,
+                typeMapping: this._commandOptions?.typeMapping
+              }),
+              () => ({
+                ...this._self.#commandTraceContext(args),
+                batchMode: 'PIPELINE' as const,
+                batchSize
+              })
+            );
+            // Prevent unhandled rejection from tracePromise wrapper; individual
+            // rejections are collected by Promise.all, but the tracePromise wrapper
+            // is a separate branch that nobody awaits.
+            traced.catch(noop);
+            return traced;
+          })
+        );
+        this._self.#scheduleWrite();
 
-    return result;
+        const result = await promise;
+
+        if (selectedDB !== undefined) {
+          this._self.#selectedDB = selectedDB;
+        }
+
+        return result;
+      },
+      () => ({
+        batchMode: 'PIPELINE' as const,
+        batchSize,
+        database: this._self.#selectedDB,
+        clientId: this._self._clientId,
+        ...this._self.#socketTraceContext()
+      })
+    );
   }
 
   /**
@@ -1327,39 +1474,52 @@ export default class RedisClient<
       throw new WatchError('Client reconnected after WATCH');
     }
 
-    const typeMapping = this._commandOptions?.typeMapping;
-    const chainId = Symbol('MULTI Chain');
-    const promises = [
-      this._self.#queue.addCommand(['MULTI'], { chainId }),
-    ];
+    const batchSize = commands.length;
 
-    for (const { args } of commands) {
-      promises.push(
-        this._self.#queue.addCommand(args, {
-          chainId,
-          typeMapping
-        })
-      );
-    }
+    return trace(CHANNELS.TRACE_BATCH,
+      async () => {
+        const typeMapping = this._commandOptions?.typeMapping;
+        const chainId = Symbol('MULTI Chain');
+        const promises: Array<Promise<unknown>> = [
+          this._self.#queue.addCommand(['MULTI'], { chainId }),
+        ];
 
-    promises.push(
-      this._self.#queue.addCommand(['EXEC'], { chainId })
+        for (const { args } of commands) {
+          promises.push(
+            this._self.#queue.addCommand(args, {
+              chainId,
+              typeMapping
+            })
+          );
+        }
+
+        promises.push(
+          this._self.#queue.addCommand(['EXEC'], { chainId })
+        );
+
+        this._self.#scheduleWrite();
+
+        const results = await Promise.all(promises),
+          execResult = results[results.length - 1];
+
+        if (execResult === null) {
+          throw new WatchError();
+        }
+
+        if (selectedDB !== undefined) {
+          this._self.#selectedDB = selectedDB;
+        }
+
+        return execResult as Array<unknown>;
+      },
+      () => ({
+        batchMode: 'MULTI' as const,
+        batchSize,
+        database: this._self.#selectedDB,
+        clientId: this._self._clientId,
+        ...this._self.#socketTraceContext()
+      })
     );
-
-    this._self.#scheduleWrite();
-
-    const results = await Promise.all(promises),
-      execResult = results[results.length - 1];
-
-    if (execResult === null) {
-      throw new WatchError();
-    }
-
-    if (selectedDB !== undefined) {
-      this._self.#selectedDB = selectedDB;
-    }
-
-    return execResult as Array<unknown>;
   }
 
   MULTI<isTyped extends MultiMode = MULTI_MODE['TYPED']>() {
@@ -1521,6 +1681,7 @@ export default class RedisClient<
       clearTimeout(this._self.#pingTimer);
       const quitPromise = this._self.#queue.addCommand<string>(['QUIT']);
       this._self.#scheduleWrite();
+      this._self.#unregisterFromMetrics();
       return quitPromise;
     });
   }
@@ -1544,6 +1705,7 @@ export default class RedisClient<
       this._self.#clientSideCache?.onClose();
 
       if (this._self.#queue.isEmpty()) {
+        this._self.#unregisterFromMetrics();
         this._self.#socket.destroySocket();
         return resolve();
       }
@@ -1552,6 +1714,7 @@ export default class RedisClient<
         if (!this._self.#queue.isEmpty()) return;
 
         this._self.#socket.off('data', maybeClose);
+        this._self.#unregisterFromMetrics();
         this._self.#socket.destroySocket();
         resolve();
       };
@@ -1569,6 +1732,7 @@ export default class RedisClient<
     this._self.#queue.flushAll(new DisconnectsClientError());
     this._self.#socket.destroy();
     this._self.#clientSideCache?.onClose();
+    this._self.#unregisterFromMetrics();
     this._self.#credentialsSubscription?.dispose();
     this._self.#credentialsSubscription = null;
   }

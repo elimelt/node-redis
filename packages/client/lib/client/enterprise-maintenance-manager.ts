@@ -7,6 +7,7 @@ import { setTimeout } from "node:timers/promises";
 import { RedisTcpSocketOptions } from "./socket";
 import diagnostics_channel from "node:diagnostics_channel";
 import { RedisArgument } from "../RESP/types";
+import { publish, CHANNELS } from "./tracing";
 
 type RedisType = RedisClient<any, any, any, any, any>;
 
@@ -95,6 +96,7 @@ export default class EnterpriseMaintenanceManager {
 
   static async getHandshakeCommand(
     options: RedisClientOptions,
+    clientId: string,
   ): Promise<
     | { cmd: Array<RedisArgument>; errorHandler: (error: Error) => void }
     | undefined
@@ -120,9 +122,18 @@ export default class EnterpriseMaintenanceManager {
       ],
       errorHandler: (error: Error) => {
         dbgMaintenance("handshake failed:", error);
+
+        publish(CHANNELS.ERROR, () => ({
+          error,
+          origin: 'client',
+          internal: true,
+          clientId,
+        }));
+
         if (options.maintNotifications === "enabled") {
           throw error;
         }
+
       },
     };
   }
@@ -147,6 +158,11 @@ export default class EnterpriseMaintenanceManager {
     }
 
     const type = String(push[0]);
+
+    publish(CHANNELS.MAINTENANCE, () => ({
+      notification: type,
+      clientId: this.#client._clientId,
+    }));
 
     emitDiagnostics({
       type,
@@ -289,6 +305,7 @@ export default class EnterpriseMaintenanceManager {
     dbgMaintenance("Resume writing");
     this.#client._unpause();
     this.#onMigrated();
+    publish(CHANNELS.CONNECTION_HANDOFF, () => ({ clientId: this.#client._clientId }));
   };
 
   #onMigrating = () => {
