@@ -621,7 +621,7 @@ export default class RedisSentinel<
   }
 }
 
-class RedisSentinelInternal<
+export class RedisSentinelInternal<
   M extends RedisModules,
   F extends RedisFunctions,
   S extends RedisScripts,
