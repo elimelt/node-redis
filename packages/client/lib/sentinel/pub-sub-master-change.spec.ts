@@ -17,6 +17,8 @@ describe('pubsub master change applies nodeAddressMap', () => {
 
   beforeEach(() => {
     changeNodeStub = sinon.stub(PubSubProxy.prototype, 'changeNode').resolves();
+    // The stub only needs to short-circuit the TCP connect; the resolved value is unused.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     clientConnectStub = sinon.stub(RedisClient.prototype, 'connect').resolves(undefined as any);
 
     internal = new RedisSentinelInternal<{}, {}, {}, 2, {}>({
